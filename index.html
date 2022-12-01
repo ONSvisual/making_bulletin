@@ -1,0 +1,341 @@
+<head>
+		<style>
+			html,
+			body {
+				position: relative;
+				width: 100%;
+				height: 100%;
+			}
+
+			body {
+				color: #333;
+				margin: 0;
+				padding: 8px;
+				box-sizing: border-box;
+				font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen-Sans, Ubuntu,
+					Cantarell, 'Helvetica Neue', sans-serif;
+			}
+
+			a {
+				color: rgb(0, 100, 200);
+				text-decoration: none;
+			}
+
+			a:hover {
+				text-decoration: underline;
+			}
+
+			a:visited {
+				color: rgb(0, 80, 160);
+			}
+
+			label {
+				display: block;
+			}
+
+			input,
+			button,
+			select,
+			textarea {
+				font-family: inherit;
+				font-size: inherit;
+				-webkit-padding: 0.4em 0;
+				padding: 0.4em;
+				margin: 0 0 0.5em 0;
+				box-sizing: border-box;
+				border: 1px solid #ccc;
+				border-radius: 2px;
+			}
+
+			input[type=range] {
+				padding: 0.4em 0;
+			}
+
+			input:disabled {
+				color: #ccc;
+			}
+
+			button {
+				color: #333;
+				background-color: #f4f4f4;
+				outline: none;
+			}
+
+			button:disabled {
+				color: #999;
+			}
+
+			button:not(:disabled):active {
+				background-color: #ddd;
+			}
+
+			button:focus {
+				border-color: #666;
+			}
+		</style>
+
+		<script>
+			(function () {
+				function handle_message(ev) {
+					let { action, cmd_id } = ev.data;
+					const send_message = (payload) => parent.postMessage({ ...payload }, ev.origin);
+					const send_reply = (payload) => send_message({ ...payload, cmd_id });
+					const send_ok = () => send_reply({ action: 'cmd_ok' });
+					const send_error = (message, stack) =>
+						send_reply({ action: 'cmd_error', message, stack });
+
+					if (action === 'eval') {
+						try {
+							const { script } = ev.data.args;
+							eval(script);
+							send_ok();
+						} catch (e) {
+							send_error(e.message, e.stack);
+						}
+					}
+
+					if (action === 'catch_clicks') {
+						try {
+							const top_origin = ev.origin;
+							document.body.addEventListener('click', (event) => {
+								if (event.which !== 1) return;
+								if (event.metaKey || event.ctrlKey || event.shiftKey) return;
+								if (event.defaultPrevented) return;
+
+								// ensure target is a link
+								let el = event.target;
+								while (el && el.nodeName !== 'A') el = el.parentNode;
+								if (!el || el.nodeName !== 'A') return;
+
+								if (
+									el.hasAttribute('download') ||
+									el.getAttribute('rel') === 'external' ||
+									el.target
+								)
+									return;
+
+								event.preventDefault();
+
+								if (el.href.startsWith(top_origin)) {
+									const url = new URL(el.href);
+									if (url.hash[0] === '#') {
+										window.location.hash = url.hash;
+										return;
+									}
+								}
+
+								window.open(el.href, '_blank');
+							});
+							send_ok();
+						} catch (e) {
+							send_error(e.message, e.stack);
+						}
+					}
+				}
+
+				window.addEventListener('message', handle_message, false);
+
+				window.onerror = function (msg, url, lineNo, columnNo, error) {
+					parent.postMessage({ action: 'error', value: error }, '*');
+				};
+
+				window.addEventListener('unhandledrejection', (event) => {
+					parent.postMessage({ action: 'unhandledrejection', value: event.reason }, '*');
+				});
+			}.call(this));
+
+			let previous = { level: null, args: null };
+
+			['clear', 'log', 'info', 'dir', 'warn', 'error', 'table'].forEach((level) => {
+				const original = console[level];
+				console[level] = (...args) => {
+					const stringifiedArgs = stringify(args);
+					if (previous.level === level && previous.args && previous.args === stringifiedArgs) {
+						parent.postMessage({ action: 'console', level, duplicate: true }, '*');
+					} else {
+						previous = { level, args: stringifiedArgs };
+
+						try {
+							parent.postMessage({ action: 'console', level, args }, '*');
+						} catch (err) {
+							parent.postMessage({ action: 'console', level: 'unclonable' }, '*');
+						}
+					}
+
+					original(...args);
+				};
+			});
+
+			[
+				{ method: 'group', action: 'console_group' },
+				{ method: 'groupEnd', action: 'console_group_end' },
+				{ method: 'groupCollapsed', action: 'console_group_collapsed' }
+			].forEach((group_action) => {
+				const original = console[group_action.method];
+				console[group_action.method] = (label) => {
+					parent.postMessage({ action: group_action.action, label }, '*');
+
+					original(label);
+				};
+			});
+
+			const timers = new Map();
+			const original_time = console.time;
+			const original_timelog = console.timeLog;
+			const original_timeend = console.timeEnd;
+
+			console.time = (label = 'default') => {
+				original_time(label);
+				timers.set(label, performance.now());
+			};
+			console.timeLog = (label = 'default') => {
+				original_timelog(label);
+				const now = performance.now();
+				if (timers.has(label)) {
+					parent.postMessage(
+						{
+							action: 'console',
+							level: 'system-log',
+							args: [`${label}: ${now - timers.get(label)}ms`]
+						},
+						'*'
+					);
+				} else {
+					parent.postMessage(
+						{ action: 'console', level: 'system-warn', args: [`Timer '${label}' does not exist`] },
+						'*'
+					);
+				}
+			};
+			console.timeEnd = (label = 'default') => {
+				original_timeend(label);
+				const now = performance.now();
+				if (timers.has(label)) {
+					parent.postMessage(
+						{
+							action: 'console',
+							level: 'system-log',
+							args: [`${label}: ${now - timers.get(label)}ms`]
+						},
+						'*'
+					);
+				} else {
+					parent.postMessage(
+						{ action: 'console', level: 'system-warn', args: [`Timer '${label}' does not exist`] },
+						'*'
+					);
+				}
+				timers.delete(label);
+			};
+
+			const original_assert = console.assert;
+			console.assert = (condition, ...args) => {
+				if (condition) {
+					const stack = new Error().stack;
+					parent.postMessage({ action: 'console', level: 'assert', args, stack }, '*');
+				}
+				original_assert(condition, ...args);
+			};
+
+			const counter = new Map();
+			const original_count = console.count;
+			const original_countreset = console.countReset;
+
+			console.count = (label = 'default') => {
+				counter.set(label, (counter.get(label) || 0) + 1);
+				parent.postMessage(
+					{ action: 'console', level: 'system-log', args: `${label}: ${counter.get(label)}` },
+					'*'
+				);
+				original_count(label);
+			};
+
+			console.countReset = (label = 'default') => {
+				if (counter.has(label)) {
+					counter.set(label, 0);
+				} else {
+					parent.postMessage(
+						{
+							action: 'console',
+							level: 'system-warn',
+							args: `Count for '${label}' does not exist`
+						},
+						'*'
+					);
+				}
+				original_countreset(label);
+			};
+
+			const original_trace = console.trace;
+
+			console.trace = (...args) => {
+				const stack = new Error().stack;
+				parent.postMessage({ action: 'console', level: 'trace', args, stack }, '*');
+				original_trace(...args);
+			};
+
+			function stringify(args) {
+				try {
+					return JSON.stringify(args);
+				} catch (error) {
+					return null;
+				}
+			}
+		</script>
+	<style id="svelte-128nepn">#download.svelte-128nepn{visibility:hidden
+	}.blur.svelte-128nepn{color:transparent;text-shadow:0 0 0.3em #000}
+/*# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiQXBwLnN2ZWx0ZSIsInNvdXJjZXMiOlsiQXBwLnN2ZWx0ZSJdLCJzb3VyY2VzQ29udGVudCI6WyI8VGl0cmVcbm5vbT1cIlRpbSBLZXJzaGF3XCIgIFxuZW1haWw9XCJ0aW0ua2Vyc2hhd0BvbnMuZ292LnVrXCIgXG5kYXRlPVwiMXN0IERlY2VtYmVyIDIwMjJcIiAgXG5wcm9jaGFpbmU9XCJUbyBiZSBhbm5vdW5jZWRcIlxuPlxuXHRcbllvdSBjYW4gYnVpbGQgYSBjbGVhcmx5IHByZXNlbnRlZCBhbmQgcHJvZmVzc2lvbmFsIGxvb2tpbmcgd2ViIHBhZ2UgdG8gYmV0dGVyIHNlcnZlIHlvdXIgdXNlcnNcblx0XG48L1RpdHJlPlxuXG48Q29udGVudT5cblxuPFNvbW1haXJlPlxuXG5UaGlzIHRvb2wgaGFzIGJlZW4gbWFkZSBmb3IgZGVtb25zdHJhdGlvbiBvZiBnb29kIHByYWN0aWNlIGluIGNyZWF0aW5nIHdlYiBjb250ZW50IGZvciB0aGUgZGlzc2VtaW5hdGlvbiBvZiBjZW5zdXMgcmVzdWx0cy4gSXQgaXMgbm90IGludGVuZGVkIGZvciB1c2UgaW4geW91ciBvZmZpY2UsIGJ1dCBpdCBjb3VsZCBiZSBjdXN0b21pc2VkIHRvIHRoZSBuZWVkcyBvZiB5b3VyIE5TTyBmb3IgdXNlIGluIHByb2R1Y3Rpb24uIEl0IGNvdWxkIGFsc28gYmUgc3R5bGVkIGFuZCBicmFuZGVkIHRvIG1hdGNoIHRoZSBhcHBlYXJhbmNlIG9mIHlvdXIgd2Vic2l0ZS4gXG5cbjwvU29tbWFpcmU+XG5cdFxuPFRhYmxlTWF0aWVyZXM+XG5cblx0XG48UHVjZT5NYWluIHBvaW50czwvUHVjZT5cbjxQdWNlPlRoZSBtb3N0IGltcG9ydGFudCBmaW5kaW5nPC9QdWNlPlxuPFB1Y2U+VGhlIHNlY29uZCBtb3N0IGltcG9ydGFudCBmaW5kaW5nPC9QdWNlPlxuPFB1Y2U+RnV0dXJlIHB1YmxpY2F0aW9uczwvUHVjZT5cbjxQdWNlPkRhdGE8L1B1Y2U+XG48UHVjZT5HbG9zc2FyeTwvUHVjZT5cbjxQdWNlPk1lYXN1cmluZyB0aGUgZGF0YTwvUHVjZT5cbjxQdWNlPlN0cmVuZ3RocyBhbmQgbGltaXRhdGlvbnM8L1B1Y2U+XG48UHVjZT5SZWxhdGVkIGxpbmtzPC9QdWNlPlxuPFB1Y2U+Q2l0ZSB0aGlzIHB1YmxpY2F0aW9uPC9QdWNlPlxuXG48L1RhYmxlTWF0aWVyZXM+XG5cdFxuPFBvaW50c1ByaW5jaXBhdXg+XG5cbjxTb3VzVGl0cmU+MS4gTWFpbiBwb2ludHM6PC9Tb3VzVGl0cmU+XG5cbjxMaXN0ZUFQdWNlcz5cblxuPFB1Y2U+b3JnYW5pc2UgeW91ciBpZGVhczwvUHVjZT5cbjxQdWNlPnVzZSB0aGUgYWN0aXZlIHZpb2NlPC9QdWNlPlxuPFB1Y2U+dXNlIHNpbXBsZSBsYW5ndWFnZTwvUHVjZT5cbjxQdWNlPnVzZSBzaG9ydCBzZW50ZW5jZXM8L1B1Y2U+XG5cbjwvTGlzdGVBUHVjZXM+XG48L1BvaW50c1ByaW5jaXBhdXg+XG5cbjxTb3VzVGl0cmU+Mi4gVGhlIG1vc3QgaW1wb3J0YW50IGZpbmRpbmc8L1NvdXNUaXRyZT5cblxuTG9yZW0gaXBzdW0gZG9sb3Igc2l0IGFtZXQsIGNvbnNlY3RldHVyIGFkaXBpc2NpbmcgZWxpdCwgc2VkIGRvIGVpdXNtb2QgdGVtcG9yIGluY2lkaWR1bnQgdXQgbGFib3JlIGV0IGRvbG9yZSBtYWduYSBhbGlxdWEuIFV0IGVuaW0gYWQgbWluaW0gdmVuaWFtLCBxdWlzIG5vc3RydWQgZXhlcmNpdGF0aW9uIHVsbGFtY28gbGFib3JpcyBuaXNpIHV0IGFsaXF1aXAgZXggZWEgY29tbW9kbyBjb25zZXF1YXQuIER1aXMgYXV0ZSBpcnVyZSBkb2xvciBpbiByZXByZWhlbmRlcml0IGluIHZvbHVwdGF0ZSB2ZWxpdCBlc3NlIGNpbGx1bSBkb2xvcmUgZXUgZnVnaWF0IG51bGxhIHBhcmlhdHVyLiBFeGNlcHRldXIgc2ludCBvY2NhZWNhdCBjdXBpZGF0YXQgbm9uIHByb2lkZW50LCBzdW50IGluIGN1bHBhIHF1aSBvZmZpY2lhIGRlc2VydW50IG1vbGxpdCBhbmltIGlkIGVzdCBsYWJvcnVtLlxuXHRcbjxUaXRyZUR1R3JhcGhpcXVlPlxuVGhpbmsgb2YgYSBjaGFydCB0aXRsZSB0aGF0IGV4cGxhaW5zIHRoZSBtYWluIG1lc3NhZ2UgdGhhdCBjYW4gYmUgdGFrZW4gZnJvbSB0aGUgY2hhcnQ8YnI+XG48L1RpdHJlRHVHcmFwaGlxdWU+XG5cdFxuPEdyYWZpcXVlPlxuXG48aWZyYW1lIHRpdGxlPVwiw4AgQmFybnNsZXksIGxhIHByb3BvcnRpb24gZGUgcGVyc29ubmVzIMOiZ8OpZXMgZGUgMzUgw6AgNDkgYW5zIGEgZGltaW51w6kgZGUgMjIgcG9pbnRzIGRlIHBvdXJjZW50YWdlXCIgYXJpYS1sYWJlbD1cIlRyYWPDqSBkZSBsYSBmbMOoY2hlXCIgaWQ9XCJkYXRhd3JhcHBlci1jaGFydC1Dc0VKTlwiIHNyYz1cImh0dHBzOi8vZGF0YXdyYXBwZXIuZHdjZG4ubmV0L0NzRUpOLzYvXCIgc2Nyb2xsaW5nPVwibm9cIiBmcmFtZWJvcmRlcj1cIjBcIiBzdHlsZT1cIndpZHRoOiAwOyBtaW4td2lkdGg6IDEwMCUgIWltcG9ydGFudDsgYm9yZGVyOiBub25lO1wiIGhlaWdodD1cIjMzMFwiIGRhdGEtZXh0ZXJuYWw9XCIxXCI+PC9pZnJhbWU+XG5cbjwvR3JhZmlxdWU+XG5cbjxTb3VzVGl0cmU+My4gVGhlIHNlY29uZCBtb3N0IGltcG9ydGFudCBmaW5kaW5nPC9Tb3VzVGl0cmU+XG5cbkxvcmVtIGlwc3VtIGRvbG9yIHNpdCBhbWV0LCBjb25zZWN0ZXR1ciBhZGlwaXNjaW5nIGVsaXQsIHNlZCBkbyBlaXVzbW9kIHRlbXBvciBpbmNpZGlkdW50IHV0IGxhYm9yZSBldCBkb2xvcmUgbWFnbmFcbmFsaXF1YS4gVXQgZW5pbSBhZCBtaW5pbSB2ZW5pYW0sIHF1aXMgbm9zdHJ1ZCBleGVyY2l0YXRpb24gdWxsYW1jbyBsYWJvcmlzIG5pc2kgdXQgYWxpcXVpcCBleCBlYSBjb21tb2RvIGNvbnNlcXVhdC5cbkR1aXMgYXV0ZSBpcnVyZSBkb2xvciBpbiByZXByZWhlbmRlcml0IGluIHZvbHVwdGF0ZSB2ZWxpdCBlc3NlIGNpbGx1bSBkb2xvcmUgZXUgZnVnaWF0IG51bGxhIHBhcmlhdHVyLiBFeGNlcHRldXJcbnNpbnQgb2NjYWVjYXQgY3VwaWRhdGF0IG5vbiBwcm9pZGVudCwgc3VudCBpbiBjdWxwYSBxdWkgb2ZmaWNpYSBkZXNlcnVudCBtb2xsaXQgYW5pbSBpZCBlc3QgbGFib3J1bS5cblxuPFRpdHJlRHVHcmFwaGlxdWU+XG5JbiBOaWdlciBvdmVyIDgwJSBvZiB0aCBlcG9wdWxhdGlvbiBsaXZlIGluIHJ1cmFsIGFyZWFzXG48L1RpdHJlRHVHcmFwaGlxdWU+XG5cbjxHcmFmaXF1ZT5cblxuPGlmcmFtZSB0aXRsZT1cIkF1IE5pZ2VyIHBsdXMgZGUgODAlIGRlIGxhIHBvcHVsYXRpb24gdml0IGVuIG1pbGlldSBydXJhbFwiIGFyaWEtbGFiZWw9XCJCYXJyZXMgZW1waWzDqWVzXCJcbmlkPVwiZGF0YXdyYXBwZXItY2hhcnQtVU90YUJcIiBzcmM9XCJodHRwczovL2RhdGF3cmFwcGVyLmR3Y2RuLm5ldC9VT3RhQi8xL1wiIHNjcm9sbGluZz1cIm5vXCIgZnJhbWVib3JkZXI9XCIwXCJcbnN0eWxlPVwid2lkdGg6IDA7IG1pbi13aWR0aDogMTAwJSAhaW1wb3J0YW50OyBib3JkZXI6IG5vbmU7XCIgaGVpZ2h0PVwiNjA0XCIgZGF0YS1leHRlcm5hbD1cIjFcIj48L2lmcmFtZT5cblxuPC9HcmFmaXF1ZT5cblx0XG5cdFxuPGRpdiBjbGFzcz1cImJsdXJcIj5cblx0XG48U291c1RpdHJlPjQuIFB1YmxpY2F0aW9ucyBmdXR1cmVzPC9Tb3VzVGl0cmU+XG5cdFxuRGVzIGRvbm7DqWVzIGV0IGRlcyBhbmFseXNlcyBwbHVzIGTDqXRhaWxsw6llcyBzdXIgbGVzIFhYWFggc2Vyb250IHB1Ymxpw6llcyBkYW5zIGxlcyBtb2lzIMOgIHZlbmlyLCBwYXJhbGzDqGxlbWVudCDDoCBsYSBwdWJsaWNhdGlvbiBkZSBkb25uw6llcyBtdWx0aXZhcmnDqWVzLlxuXG5cbjxTb3VzVGl0cmU+NS4gRG9ubsOpZXMgbGnDqWVzIMOgIGNlIHN1amV0PC9Tb3VzVGl0cmU+XG5cbjxEb25uZXM+XG48YSBocmVmPSdzZWxmJz5Ob21icmUgZGUgcsOpc2lkZW50cyBoYWJpdHVlbHMgZGFucyBsZXMgbcOpbmFnZXMgZXQgw6l0YWJsaXNzZW1lbnRzIGNvbW11bmF1eDwvYT48YnI+XG5KZXUgZGUgZG9ubsOpZXMgfCBTb3J0aWUgbGUgMiBub3ZlbWJyZSAyMDIyPGJyPlxuQ2V0IGVuc2VtYmxlIGRlIGRvbm7DqWVzIGZvdXJuaXQgZGVzIGVzdGltYXRpb25zIGR1IHJlY2Vuc2VtZW50IGRlIDIwMjEgcXVpIGNsYXNzZW50IGxlcyByw6lzaWRlbnRzIGhhYml0dWVscyBlbiBBbmdsZXRlcnJlIGV0IGF1IFBheXMgZGUgR2FsbGVzIHNlbG9uIHF1J2lscyByw6lzaWRhaWVudCBkYW5zIGRlcyBtw6luYWdlcyBldCBkZXMgw6l0YWJsaXNzZW1lbnRzIGNvbW11bmF1eC4gTGVzIGVzdGltYXRpb25zIHNvbnQgZW4gZGF0ZSBkdSBqb3VyIGR1IHJlY2Vuc2VtZW50LCBsZSAyMSBtYXJzIDIwMjEuXG48L0Rvbm5lcz5cblx0XG48RG9ubmVzPlxuPGEgaHJlZj0nc2VsZic+U3RhdHV0IGp1cmlkaXF1ZSBkdSBwYXJ0ZW5hcmlhdDwvYT48YnI+XG5KZXUgZGUgZG9ubsOpZXMgfCBTb3J0aWUgbGUgMiBub3ZlbWJyZSAyMDIyPGJyPlxuQ2V0IGVuc2VtYmxlIGRlIGRvbm7DqWVzIGZvdXJuaXQgZGVzIGVzdGltYXRpb25zIGR1IHJlY2Vuc2VtZW50IGRlIDIwMjEgcXVpIGNsYXNzZW50IGxlcyByw6lzaWRlbnRzIGhhYml0dWVscyBlbiBBbmdsZXRlcnJlIGV0IGF1IFBheXMgZGUgR2FsbGVzIHNlbG9uIGxldXIgc3RhdHV0IGRlIHBhcnRlbmFyaWF0IGzDqWdhbC4gTGVzIGVzdGltYXRpb25zIHNvbnQgYXUgam91ciBkdSByZWNlbnNlbWVudCwgbGUgMjEgbWFycyAyMDIxLlxuPC9Eb25uZXM+XG5cdFxuPFNvdXNUaXRyZT42LiBHbG9zc2FpcmU8L1NvdXNUaXRyZT5cblx0XG48aDQ+RW5mYW50IMOgIGNoYXJnZTwvaDQ+XG5cblVuIGVuZmFudCDDoCBjaGFyZ2UgZXN0IHVuZSBwZXJzb25uZSDDomfDqWUgZGUgMCDDoCAxNSBhbnMgZGFucyB1biBtw6luYWdlIG91IHVuZSBwZXJzb25uZSDDomfDqWUgZGUgMTYgw6AgMTggYW5zIHF1aSBlc3QgYXV4IMOpdHVkZXMgw6AgdGVtcHMgcGxlaW4gZXQgdml0IGVuIGZhbWlsbGUgYXZlYyBzb24gcGFyZW50LCBzZXMgcGFyZW50cywgc2VzIGdyYW5kcy1wYXJlbnRzIG91IHNlcyBncmFuZHMtcGFyZW50cy4gSWwgbidpbmNsdXQgcGFzIHRvdXRlIHBlcnNvbm5lIMOiZ8OpZSBkZSAxNiDDoCAxOCBhbnMgcXVpIGEgdW4gY29uam9pbnQsIHVuIHBhcnRlbmFpcmUgb3UgdW4gZW5mYW50IHZpdmFudCBkYW5zIGxlIG3DqW5hZ2UuXG5cbjxoND5GYW1pbGxlPC9oND5cblx0XG5VbmUgZmFtaWxsZSBlc3QgdW4gZ3JvdXBlIGRlIHBlcnNvbm5lcyBxdWkgc29udCBzb2l0IDpcblxuPExpc3RlQVB1Y2VzPlxuPFB1Y2U+Y291cGxlIG1hcmnDqSwgcGFjc8OpIG91IGNvaGFiaXRhbnQgYXZlYyBvdSBzYW5zIGVuZmFudHMgKGxlcyBlbmZhbnRzIG4nb250IHBhcyBiZXNvaW4gZCdhcHBhcnRlbmlyIGF1eCBkZXV4IG1lbWJyZXMgZHUgY291cGxlKTwvUHVjZT5cbjxQdWNlPnVuIHBhcmVudCBzZXVsIGF2ZWMgZGVzIGVuZmFudHM8L1B1Y2U+XG48UHVjZT51biBjb3VwbGUgbWFyacOpLCBwYWNzw6kgb3UgY29uY3ViaW4gYXZlYyBkZXMgcGV0aXRzLWVuZmFudHMgbWFpcyBvw7kgbGVzIHBhcmVudHMgZGUgY2VzIHBldGl0cy1lbmZhbnRzIG5lIHNvbnQgcGFzIHByw6lzZW50czwvUHVjZT5cbjxQdWNlPnVuIGdyYW5kLXBhcmVudCBzZXVsIG91IGVuIGNvdXBsZSBhdmVjIGRlcyBwZXRpdHMtZW5mYW50cyBtYWlzIG/DuSBsZXMgcGFyZW50cyBkZSBjZXMgcGV0aXRzLWVuZmFudHMgbmUgc29udCBwYXMgcHLDqXNlbnQ8L1B1Y2U+XG48L0xpc3RlQVB1Y2VzPlxuXHRcbjxTb3VzVGl0cmU+Ny4gTWVzdXJlciBsZXMgZG9ubsOpZXM8L1NvdXNUaXRyZT5cbjxoND5EYXRlIGRlIHLDqWbDqXJlbmNlPC9oND5cbkxlIHJlY2Vuc2VtZW50IGZvdXJuaXQgZGVzIGVzdGltYXRpb25zIGRlcyBjYXJhY3TDqXJpc3RpcXVlcyBkZSB0b3V0ZXMgbGVzIHBlcnNvbm5lcyBldCBkZSB0b3VzIGxlcyBtw6luYWdlcyBlbiBBbmdsZXRlcnJlIGV0IGF1IFBheXMgZGUgR2FsbGVzIGxlIGpvdXIgZHUgcmVjZW5zZW1lbnQsIGxlIDIxIG1hcnMgMjAyMS4gSWwgZXN0IGVmZmVjdHXDqSB0b3VzIGxlcyAxMCBhbnMgZXQgbm91cyBkb25uZSBsJ2VzdGltYXRpb24gbGEgcGx1cyBwcsOpY2lzZSBkZSB0b3V0ZXMgbGVzIHBlcnNvbm5lcyBldCBkZSB0b3VzIGxlcyBtw6luYWdlcyBlbiBBbmdsZXRlcnJlIGV0IGF1IFBheXMgZGUgR2FsbGVzLlxuPGJyPjxicj5cbk5vdXMgc29tbWVzIHJlc3BvbnNhYmxlcyBkZSBsYSByw6lhbGlzYXRpb24gZHUgcmVjZW5zZW1lbnQgZW4gQW5nbGV0ZXJyZSBldCBhdSBQYXlzIGRlIEdhbGxlcywgbWFpcyBwdWJsaWVyb25zIMOpZ2FsZW1lbnQgZGVzIHLDqXN1bHRhdHMgcG91ciBsZSBSb3lhdW1lLVVuaSBlbiBwYXJ0ZW5hcmlhdCBhdmVjIGxlIGdvdXZlcm5lbWVudCBnYWxsb2lzLCBsZSBOYXRpb25hbCBSZWNvcmRzIG9mIFNjb3RsYW5kIChOUlMpIGV0IGxhIE5vcnRoZXJuIElyZWxhbmQgU3RhdGlzdGljcyBhbmQgUmVzZWFyY2ggQWdlbmN5IChOSVNSQSkuIExlIHJlY2Vuc2VtZW50IGVuIElybGFuZGUgZHUgTm9yZCBhIMOpZ2FsZW1lbnQgw6l0w6kgZWZmZWN0dcOpIGxlIDIxIG1hcnMgMjAyMSwgdGFuZGlzIHF1ZSBsZSByZWNlbnNlbWVudCBlbiDDiWNvc3NlIGEgw6l0w6kgZMOpcGxhY8OpIGF1IDIwIG1hcnMgMjAyMi4gVG91cyBsZXMgYnVyZWF1eCBkZSByZWNlbnNlbWVudCBicml0YW5uaXF1ZXMgdHJhdmFpbGxlbnQgZW4gw6l0cm9pdGUgY29sbGFib3JhdGlvbiBwb3VyIGNvbXByZW5kcmUgY29tbWVudCBjZXR0ZSBkaWZmw6lyZW5jZSBkZSBkYXRlcyBkZSByw6lmw6lyZW5jZSBhdXJhIHVuIGltcGFjdCBzdXIgbGVzIHN0YXRpc3RpcXVlcyBkZSBsYSBwb3B1bGF0aW9uIGV0IGR1IGxvZ2VtZW50IMOgIGwnw6ljaGVsbGUgZHUgUm95YXVtZS1VbmksIGVuIHRlcm1lcyBkZSBjYWxlbmRyaWVyIGV0IGRlIHBvcnTDqWUuXG5cbjxoND5UYXV4IGRlIHLDqXBvbnNlPC9oND5cbkxlIHRhdXggZGUgcsOpcG9uc2UgZGVzIHBlcnNvbm5lcyBlc3QgbGUgbm9tYnJlIGRlIHLDqXNpZGVudHMgaGFiaXR1ZWxzIHBvdXIgbGVzcXVlbHMgZGVzIGTDqXRhaWxzIGluZGl2aWR1ZWxzIG9udCDDqXTDqSBmb3VybmlzIHN1ciB1biBxdWVzdGlvbm5haXJlIHJldG91cm7DqSwgZGl2aXPDqSBwYXIgbGEgcG9wdWxhdGlvbiByw6lzaWRlbnRlIGhhYml0dWVsbGUgZXN0aW3DqWUuXG48YnI+PGJyPlxuTGUgdGF1eCBkZSByw6lwb25zZSBkZXMgcGVyc29ubmVzIHBvdXIgbGUgcmVjZW5zZW1lbnQgMjAyMSDDqXRhaXQgZGUgOTclIGRlIGxhIHBvcHVsYXRpb24gcsOpc2lkZW50ZSBoYWJpdHVlbGxlIGQnQW5nbGV0ZXJyZSBldCBkdSBQYXlzIGRlIEdhbGxlcywgZXQgZGUgcGx1cyBkZSA4OCUgZGFucyB0b3V0ZXMgbGVzIGF1dG9yaXTDqXMgbG9jYWxlcy4gTGEgcGx1cGFydCBkZXMgcmV0b3VycyAoODkgJSkgb250IMOpdMOpIHJlw6d1cyBlbiBsaWduZS4gTGUgdGF1eCBkZSByw6lwb25zZSBhIGTDqXBhc3PDqSBub3RyZSBvYmplY3RpZiBkZSA5NCAlIGRhbnMgbCdlbnNlbWJsZSBldCBkZSA4MCAlIGRhbnMgdG91dGVzIGxlcyBjb2xsZWN0aXZpdMOpcyBsb2NhbGVzLlxuXG48U291c1RpdHJlPjguIEZvcmNlcyBldCBsaW1pdGVzPC9Tb3VzVGl0cmU+XG5MZXMgY29uc2lkw6lyYXRpb25zIGRlIHF1YWxpdMOpIGFpbnNpIHF1ZSBsZXMgZm9yY2VzIGV0IGxlcyBsaW1pdGVzIGR1IFJlY2Vuc2VtZW50IDIwMjEgc29udCBwbHVzIGfDqW7DqXJhbGVtZW50IGZvdXJuaWVzIGRhbnMgbm9zIEluZm9ybWF0aW9ucyBzdXIgbGEgcXVhbGl0w6kgZXQgbGEgbcOpdGhvZG9sb2dpZSAoUU1JKSBwb3VyIGxlIFJlY2Vuc2VtZW50IDIwMjEuIEVuIHNhdm9pciBwbHVzIHN1ciBsZXMgY29uc2lkw6lyYXRpb25zIGRlIHF1YWxpdMOpIHNww6ljaWZpcXVlcyBwb3VyIGxhIGTDqW1vZ3JhcGhpZSBldCBsYSBtaWdyYXRpb24uXG5cdFxuPFNvdXNUaXRyZT45LiBMaWVucyBjb25uZXhlczwvU291c1RpdHJlPlxuPGEgaHJlZj0nc2VsZic+TWlncmF0aW9uIGludGVybmF0aW9uYWxlLCBBbmdsZXRlcnJlIGV0IFBheXMgZGUgR2FsbGVzIDogUmVjZW5zZW1lbnQgMjAyMTwvYT48YnI+XG5CdWxsZXRpbiB8IFNvcnRpZSBsZSAyIG5vdmVtYnJlIDIwMjI8YnI+XG5Eb25uw6llcyBkdSByZWNlbnNlbWVudCAyMDIxIHN1ciBsYSBtaWdyYXRpb24gaW50ZXJuYXRpb25hbGUgZW4gQW5nbGV0ZXJyZSBldCBhdSBQYXlzIGRlIEdhbGxlcy5cbjxicj48YnI+XG48YSBocmVmPSdzZWxmJz5DYXJ0ZXMgZGUgcmVjZW5zZW1lbnQ8L2E+PGJyPlxuQ29udGVudSBpbnRlcmFjdGlmIHwgU29ydGllIGxlIDIgbm92ZW1icmUgMjAyMjxicj5cbk91dGlsIGNhcnRvZ3JhcGhpcXVlIGludGVyYWN0aWYgcXVpIHZpc3VhbGlzZSBsZXMgZG9ubsOpZXMgZHUgcmVjZW5zZW1lbnQgMjAyMSBzdXIgZGlmZsOpcmVudHMgc3VqZXRzIGp1c3F1J2F1IG5pdmVhdSBkJ3VuZSBhdXRvcml0w6kgbG9jYWxlIGV0IGQndW4gcXVhcnRpZXIuXG48U291c1RpdHJlPjEwLiBDaXRleiBjZSBidWxsZXRpbiBzdGF0aXN0aXF1ZTwvU291c1RpdHJlPlxuT2ZmaWNlIGZvciBOYXRpb25hbCBTdGF0aXN0aWNzIChPTlMpLCBwdWJsacOpIGxlIDIgbm92ZW1icmUgMjAyMiwgc2l0ZSBXZWIgZGUgbCdPTlMsIGJ1bGxldGluIHN0YXRpc3RpcXVlLCBDYXJhY3TDqXJpc3RpcXVlcyBkZXMgbcOpbmFnZXMgZXQgZGVzIHLDqXNpZGVudHMsIEFuZ2xldGVycmUgZXQgUGF5cyBkZSBHYWxsZXMgOiBSZWNlbnNlbWVudCAyMDIxXG48L2Rpdj5cbjwvQ29udGVudT5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuXG5cblxuPCEtLU5lIHJpZW4gY2hhbmdlciBlbiBkZXNzb3VzIGRlIGNldHRlIGxpZ25lLS0+XG48YnI+PGJyPlxuPGhyPlxuXG48YnV0dG9uIHN0eWxlOmJhY2tncm91bmQtY29sb3I9XCJncmVlblwiIHN0eWxlOmNvbG9yPVwid2hpdGVcIiBvbjpjbGljaz17KCk9PntsZXQgdGV4dCA9IGRvY3VtZW50LmdldEVsZW1lbnRzQnlUYWdOYW1lKCdodG1sJylbMF0uaW5uZXJIVE1MLnNwbGl0KCc8aHI+JylbMF0rXCI8YnI+PGJyPjwvYm9keT5cIjsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoXCJkb3dubG9hZFwiKS5pbm5lckhUTUw9dGV4dDsgZG9jdW1lbnQuZ2V0RWxlbWVudEJ5SWQoXCJkb3dubG9hZFwiKS5zdHlsZS52aXNpYmlsaXR5PVwidmlzaWJsZVwiOyBuYXZpZ2F0b3IuY2xpcGJvYXJkLndyaXRlVGV4dCh0ZXh0KTsgYWxlcnQoXCJMZSBjb2RlIEhUTUwgYSDDqXTDqSBjb3Bpw6kgZGFucyB2b3RyZSBwcmVzc2UtcGFwaWVycy4gQ29sbGV6LWxlIGRhbnMgdW4gc2ltcGxlIMOpZGl0ZXVyIGRlIHRleHRlIGNvbW1lIE1TIEJsb2Mtbm90ZXMgKE5vdGVwYWQpIGV0IGVucmVnaXN0cmV6LWxlIHNvdXMgJ2luZGV4Lmh0bWwnIFxcbkxvcnNxdWUgdm91cyBjbGlxdWV6IHN1ciBsJ2ljw7RuZSBkZSB2b3RyZSBub3V2ZWF1IGZpY2hpZXIsIGlsIGRldnJhaXQgb3V2cmlyIGxhIHBhZ2UgV2ViIHF1ZSB2b3VzIGF2ZXogY3LDqcOpZSBkYW5zIHVuIG5hdmlnYXRldXIuIFxcbiBcXG5UaGUgSFRNTCBjb2RlIGhhcyBiZWVuIGNvcGllZCB0byB5b3VyIGNsaXBib2FyZC4gUGFzdGUgaXQgaW50byBhIHNpbXBsZSB0ZXh0IGVkaXRvciBsaWtlIE1TIE5vdGVwYWQgYW5kIHNhdmUgaXQgYXMgJ2luZGV4Lmh0bWwnIFxcbldoZW4geW91IGNsaWNrIG9uIHRoZSBpY29uIGZvciB5b3VyIG5ldyBmaWxlLCBpdCBzaG91bGQgb3BlbiB0aGUgd2ViIHBhZ2UgeW91IGhhdmUgY3JlYXRlZCBpbiBhIGJyb3dzZXIuXCIpOyB9IH0+XG5PYnRlbmlyIGxlIGNvZGUgSFRNTCBkZSB2b3RyZSBwYWdlXG48L2J1dHRvbj5cbjx0ZXh0YXJlYSBzdHlsZTp3aWR0aD0xMDAlIGlkPVwiZG93bmxvYWRcIj48L3RleHRhcmVhPlxuXG5cbjxzY3JpcHQ+aW1wb3J0IFRhYmxlTWF0aWVyZXMgZnJvbSAnLi9UYWJsZU1hdGllcmVzLnN2ZWx0ZSc7aW1wb3J0IERvbm5lcyBmcm9tICcuL0Rvbm5lcy5zdmVsdGUnOyBpbXBvcnQgQ29udGVudSBmcm9tICcuL0NvbnRlbnUuc3ZlbHRlJzsgaW1wb3J0IFRpdHJlIGZyb20gJy4vVGl0cmUuc3ZlbHRlJzsgaW1wb3J0IEdyYWZpcXVlIGZyb20gJy4vR3JhZmlxdWUuc3ZlbHRlJzsgaW1wb3J0IExpc3RlQVB1Y2VzIGZyb20gJy4vTGlzdGVBUHVjZXMuc3ZlbHRlJzsgaW1wb3J0IFB1Y2UgZnJvbSAnLi9QdWNlLnN2ZWx0ZSc7IGltcG9ydCBTb21tYWlyZSBmcm9tICcuL1NvbW1haXJlLnN2ZWx0ZSc7IGltcG9ydCBQb2ludHNQcmluY2lwYXV4IGZyb20gJy4vUG9pbnRzUHJpbmNpcGF1eC5zdmVsdGUnOyBpbXBvcnQgU291c1RpdHJlIGZyb20gJy4vU291c1RpdHJlLnN2ZWx0ZSc7IGltcG9ydCBUaXRyZUR1R3JhcGhpcXVlIGZyb20gJy4vVGl0cmVEdUdyYXBoaXF1ZS5zdmVsdGUnOyBpbXBvcnQgeyBkb3dubG9hZCB9IGZyb20gJy4vZG93bmxvYWRIVE1MJzs8L3NjcmlwdD5cblxuPHN0eWxlPlxuXHQjZG93bmxvYWR7XG5cdHZpc2liaWxpdHk6aGlkZGVuXG5cdH1cblx0LmJsdXIge1xuXHRcdGNvbG9yOiB0cmFuc3BhcmVudDtcblx0XHR0ZXh0LXNoYWRvdzogMCAwIDAuM2VtICMwMDA7XG5cdH1cbjwvc3R5bGU+Il0sIm5hbWVzIjpbXSwibWFwcGluZ3MiOiJBQWdPQyx3QkFBUyxDQUFDLEFBQ1YsV0FBVyxNQUFNO0NBQ2pCLENBQUMsQUFDRCxLQUFLLGVBQUMsQ0FBQyxBQUNOLEtBQUssQ0FBRSxXQUFXLENBQ2xCLFdBQVcsQ0FBRSxDQUFDLENBQUMsQ0FBQyxDQUFDLEtBQUssQ0FBQyxJQUFJLEFBQzVCLENBQUMifQ== */</style><style id="svelte-1tjz8ya">.background.svelte-1tjz8ya{background-color:#023833;color:white;padding:40px}h1.svelte-1tjz8ya,.details.svelte-1tjz8ya{max-width:800px;margin:auto}a.svelte-1tjz8ya{color:white;text-decoration:underline}
+/*# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiVGl0cmUuc3ZlbHRlIiwic291cmNlcyI6WyJUaXRyZS5zdmVsdGUiXSwic291cmNlc0NvbnRlbnQiOlsiPHNjcmlwdD5cbmV4cG9ydCBsZXQgbm9tPVwiQWFkYW4gVE9VUkVcIiwgZW1haWw9XCJhYWRhbi50b3VyZUBzb21ld2hlcmVcIiwgZGF0ZT1cIjI4IG5vdmVtYnJlIDIwMjJcIiwgcHJvY2hhaW5lPVwiw4p0cmUgYW5ub25jw6lcIlxuPC9zY3JpcHQ+XG5cbjxkaXYgY2xhc3M9J2JhY2tncm91bmQnPlxuXHRcblxuPGgxPlxuXG5cdDxzbG90Pjwvc2xvdD5cblxuPC9oMT48YnI+XG48ZGl2IGNsYXNzPVwiZGV0YWlsc1wiPlxuXG48Yj5Db250YWN0OjwvYj48YnI+XG48YSBocmVmID0gXCJtYWlsdG86e2VtYWlsfVwiPntub219PC9hPjxicj48YnI+XG48Yj5EYXRlIG9mIHB1YmxpY2F0aW9uOjwvYj48YnI+XG57ZGF0ZX08YnI+PGJyPlxuPGI+TmV4dCByZWxlYXNlOjwvYj48YnI+XG57cHJvY2hhaW5lfVxuPC9kaXY+XG48L2Rpdj5cbjxicj5cblxuPHN0eWxlPlxuLmJhY2tncm91bmR7XG5iYWNrZ3JvdW5kLWNvbG9yOiMwMjM4MzM7XG5jb2xvcjp3aGl0ZTtcbnBhZGRpbmc6NDBweDtcblxufVxuXHRoMSwgLmRldGFpbHN7XG5tYXgtd2lkdGg6ODAwcHg7XG5tYXJnaW46YXV0b31cblx0YXtcbmNvbG9yOndoaXRlO1xudGV4dC1kZWNvcmF0aW9uOiB1bmRlcmxpbmU7XG59XG48L3N0eWxlPiJdLCJuYW1lcyI6W10sIm1hcHBpbmdzIjoiQUF5QkEsMEJBQVcsQ0FBQyxBQUNaLGlCQUFpQixPQUFPLENBQ3hCLE1BQU0sS0FBSyxDQUNYLFFBQVEsSUFBSSxBQUVaLENBQUMsQUFDQSxpQkFBRSxDQUFFLHVCQUFRLENBQUMsQUFDZCxVQUFVLEtBQUssQ0FDZixPQUFPLElBQUksQ0FBQyxBQUNYLGdCQUFDLENBQUMsQUFDSCxNQUFNLEtBQUssQ0FDWCxlQUFlLENBQUUsU0FBUyxBQUMxQixDQUFDIn0= */</style><style id="svelte-1405kk4">.summary.svelte-1405kk4{color:#023833;font-weight:bold;font-size:1.4em
+}
+/*# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiU29tbWFpcmUuc3ZlbHRlIiwic291cmNlcyI6WyJTb21tYWlyZS5zdmVsdGUiXSwic291cmNlc0NvbnRlbnQiOlsiPGRpdiBjbGFzcz1cInN1bW1hcnlcIj5cblx0XG48c2xvdD48L3Nsb3Q+XG48L2Rpdj5cblxuPHN0eWxlPlxuXHQuc3VtbWFyeXtcbmNvbG9yOiMwMjM4MzM7XG5mb250LXdlaWdodDpib2xkO1xuZm9udC1zaXplOjEuNGVtXG59XG48L3N0eWxlPiJdLCJuYW1lcyI6W10sIm1hcHBpbmdzIjoiQUFNQyx1QkFBUSxDQUFDLEFBQ1YsTUFBTSxPQUFPLENBQ2IsWUFBWSxJQUFJLENBQ2hCLFVBQVUsS0FBSztBQUNmLENBQUMifQ== */</style><style id="svelte-1dh7rah">.pointsPrincipaux.svelte-1dh7rah{font-weight:bold
+}
+/*# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiUG9pbnRzUHJpbmNpcGF1eC5zdmVsdGUiLCJzb3VyY2VzIjpbIlBvaW50c1ByaW5jaXBhdXguc3ZlbHRlIl0sInNvdXJjZXNDb250ZW50IjpbIjxkaXYgY2xhc3M9XCJwb2ludHNQcmluY2lwYXV4XCI+XG5cdFxuPHNsb3Q+PC9zbG90PlxuXG48L2Rpdj5cblxuPHN0eWxlPlxuXHQucG9pbnRzUHJpbmNpcGF1eHtcbmZvbnQtd2VpZ2h0OiBib2xkXG59XG48L3N0eWxlPiJdLCJuYW1lcyI6W10sIm1hcHBpbmdzIjoiQUFPQyxnQ0FBaUIsQ0FBQyxBQUNuQixXQUFXLENBQUUsSUFBSTtBQUNqQixDQUFDIn0= */</style></head>
+	<body><div class="background svelte-1tjz8ya"><h1 class="svelte-1tjz8ya">You can build a clearly presented and professional looking web page to better serve your users </h1><br> <div class="details svelte-1tjz8ya"><b>Contact:</b><br> <a href="mailto:tim.kershaw@ons.gov.uk" class="svelte-1tjz8ya">Tim Kershaw</a><br><br> <b>Date of publication:</b><br> 1st December 2022<br><br> <b>Next release:</b><br> To be announced</div></div> <br> <div id="contenu" style="max-width: 800px; margin: auto;"><div class="summary svelte-1405kk4">This tool has been made for demonstration of good practice in creating web content for the dissemination of census results. It is not intended for use in your office, but it could be customised to the needs of your NSO for use in production. It could also be styled and branded to match the appearance of your website.</div> <h2 style="font-weight: normal;">Table of contents</h2> <ol><li>Main points</li> <li>The most important finding</li> <li>The second most important finding</li> <li>Future publications</li> <li>Data</li> <li>Glossary</li> <li>Measuring the data</li> <li>Strengths and limitations</li> <li>Related links</li> <li>Cite this publication</li></ol> <div class="pointsPrincipaux svelte-1dh7rah"><br> <h2>1. Main points:</h2> <ul><li>organise your ideas</li> <li>use the active vioce</li> <li>use simple language</li> <li>use short sentences</li></ul></div> <br> <h2>2. The most important finding</h2>
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+	
+<h3>Think of a chart title that explains the main message that can be taken from the chart<br></h3> <iframe title="À Barnsley, la proportion de personnes âgées de 35 à 49 ans a diminué de 22 points de pourcentage" aria-label="Tracé de la flèche" id="datawrapper-chart-CsEJN" src="https://datawrapper.dwcdn.net/CsEJN/6/" scrolling="no" frameborder="0" height="330" data-external="1" style="width: 0px; min-width: 100% !important; border: none;"></iframe> <br> <h2>3. The second most important finding</h2>
+
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna
+aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
+Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur
+sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+
+<h3>In Niger over 80% of th epopulation live in rural areas</h3> <iframe title="Au Niger plus de 80% de la population vit en milieu rural" aria-label="Barres empilées" id="datawrapper-chart-UOtaB" src="https://datawrapper.dwcdn.net/UOtaB/1/" scrolling="no" frameborder="0" height="604" data-external="1" style="width: 0px; min-width: 100% !important; border: none;"></iframe> <div class="blur svelte-128nepn"><br> <h2>4. Publications futures</h2>
+	
+Des données et des analyses plus détaillées sur les XXXX seront publiées dans les mois à venir, parallèlement à la publication de données multivariées.
+
+
+<br> <h2>5. Données liées à ce sujet</h2> <a href="self">Nombre de résidents habituels dans les ménages et établissements communaux</a><br>
+Jeu de données | Sortie le 2 novembre 2022<br>
+Cet ensemble de données fournit des estimations du recensement de 2021 qui classent les résidents habituels en Angleterre et au Pays de Galles selon qu'ils résidaient dans des ménages et des établissements communaux. Les estimations sont en date du jour du recensement, le 21 mars 2021.<br><br> <a href="self">Statut juridique du partenariat</a><br>
+Jeu de données | Sortie le 2 novembre 2022<br>
+Cet ensemble de données fournit des estimations du recensement de 2021 qui classent les résidents habituels en Angleterre et au Pays de Galles selon leur statut de partenariat légal. Les estimations sont au jour du recensement, le 21 mars 2021.<br><br> <br> <h2>6. Glossaire</h2> <h4>Enfant à charge</h4>
+
+Un enfant à charge est une personne âgée de 0 à 15 ans dans un ménage ou une personne âgée de 16 à 18 ans qui est aux études à temps plein et vit en famille avec son parent, ses parents, ses grands-parents ou ses grands-parents. Il n'inclut pas toute personne âgée de 16 à 18 ans qui a un conjoint, un partenaire ou un enfant vivant dans le ménage.
+
+<h4>Famille</h4>
+	
+Une famille est un groupe de personnes qui sont soit :
+
+<ul><li>couple marié, pacsé ou cohabitant avec ou sans enfants (les enfants n'ont pas besoin d'appartenir aux deux membres du couple)</li> <li>un parent seul avec des enfants</li> <li>un couple marié, pacsé ou concubin avec des petits-enfants mais où les parents de ces petits-enfants ne sont pas présents</li> <li>un grand-parent seul ou en couple avec des petits-enfants mais où les parents de ces petits-enfants ne sont pas présent</li></ul> <br> <h2>7. Mesurer les données</h2> <h4>Date de référence</h4>
+Le recensement fournit des estimations des caractéristiques de toutes les personnes et de tous les ménages en Angleterre et au Pays de Galles le jour du recensement, le 21 mars 2021. Il est effectué tous les 10 ans et nous donne l'estimation la plus précise de toutes les personnes et de tous les ménages en Angleterre et au Pays de Galles.
+<br><br>
+Nous sommes responsables de la réalisation du recensement en Angleterre et au Pays de Galles, mais publierons également des résultats pour le Royaume-Uni en partenariat avec le gouvernement gallois, le National Records of Scotland (NRS) et la Northern Ireland Statistics and Research Agency (NISRA). Le recensement en Irlande du Nord a également été effectué le 21 mars 2021, tandis que le recensement en Écosse a été déplacé au 20 mars 2022. Tous les bureaux de recensement britanniques travaillent en étroite collaboration pour comprendre comment cette différence de dates de référence aura un impact sur les statistiques de la population et du logement à l'échelle du Royaume-Uni, en termes de calendrier et de portée.
+
+<h4>Taux de réponse</h4>
+Le taux de réponse des personnes est le nombre de résidents habituels pour lesquels des détails individuels ont été fournis sur un questionnaire retourné, divisé par la population résidente habituelle estimée.
+<br><br>
+Le taux de réponse des personnes pour le recensement 2021 était de 97% de la population résidente habituelle d'Angleterre et du Pays de Galles, et de plus de 88% dans toutes les autorités locales. La plupart des retours (89 %) ont été reçus en ligne. Le taux de réponse a dépassé notre objectif de 94 % dans l'ensemble et de 80 % dans toutes les collectivités locales.
+
+<br> <h2>8. Forces et limites</h2>
+Les considérations de qualité ainsi que les forces et les limites du Recensement 2021 sont plus généralement fournies dans nos Informations sur la qualité et la méthodologie (QMI) pour le Recensement 2021. En savoir plus sur les considérations de qualité spécifiques pour la démographie et la migration.
+	
+<br> <h2>9. Liens connexes</h2> <a href="self">Migration internationale, Angleterre et Pays de Galles : Recensement 2021</a><br>
+Bulletin | Sortie le 2 novembre 2022<br>
+Données du recensement 2021 sur la migration internationale en Angleterre et au Pays de Galles.
+<br><br> <a href="self">Cartes de recensement</a><br>
+Contenu interactif | Sortie le 2 novembre 2022<br>
+Outil cartographique interactif qui visualise les données du recensement 2021 sur différents sujets jusqu'au niveau d'une autorité locale et d'un quartier.
+<br> <h2>10. Citez ce bulletin statistique</h2>
+Office for National Statistics (ONS), publié le 2 novembre 2022, site Web de l'ONS, bulletin statistique, Caractéristiques des ménages et des résidents, Angleterre et Pays de Galles : Recensement 2021</div></div> <br><br> <br><br></body>
